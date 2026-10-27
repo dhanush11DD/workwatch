@@ -1,0 +1,10 @@
+# ByteTrack settings tuned for sampled CCTV frames (default sample rate 8 fps).
+# track_buffer is in *processed* frames: 50 frames @ 8 fps keeps a lost person's id for ~6 s,
+# which bridges short occlusions behind machines or other workers.
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 50
+match_thresh: 0.8
+fuse_score: True

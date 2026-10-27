@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+data/
+*.pt
+.env
+samples/*_thumbs/
+samples/res*.json
