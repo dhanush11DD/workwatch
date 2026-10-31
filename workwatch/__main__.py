@@ -1,12 +1,13 @@
 """Command line entry point:  python -m workwatch <command>
 
-  serve        start the dashboard + API            (python -m workwatch serve --port 8000)
-  analyze      run the YOLOv8 pipeline on a file    (python -m workwatch analyze clip.mp4 --zones zones.json -o results.json)
-  import       import a results.json into a video   (python -m workwatch import 3 results.json)
-  daily        ingest inbox, analyse, report, email (python -m workwatch daily --date 2026-10-27)
-  record       record a camera stream into a video  (python -m workwatch record 1 --minutes 60)
-  create-user  add a dashboard account              (python -m workwatch create-user boss@acme.com --role manager)
-  seed-demo    load a clip as the demo video        (python -m workwatch seed-demo clip.mp4 --zones zones.json)
+  serve        start the dashboard + API (+ in-process analysis worker)   python -m workwatch serve --port 8000
+  worker       run analysis jobs from the queue                          python -m workwatch worker
+               ... on a remote GPU box, over HTTP                         python -m workwatch worker --server https://app --token $WW_WORKER_TOKEN
+  analyze      run stage 1 (detect + track) on a file -> results.zip     python -m workwatch analyze clip.mp4 -o results.zip
+  import       import a results.zip/json into a video                    python -m workwatch import 3 results.zip
+  maintenance  inbox ingest, retention, camera health, reminders         python -m workwatch maintenance
+  seed-demo    analyse the sample clip once; new organizations get it    python -m workwatch seed-demo samples/warehouse_sample.mp4 --zones samples/demo_zones.json
+  create-org   create an organization + manager from the shell           python -m workwatch create-org "Acme Steel" boss@acme.com
 """
 import argparse
 import getpass
@@ -24,38 +25,34 @@ def main(argv=None):
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
 
+    w = sub.add_parser("worker")
+    w.add_argument("--server", help="WorkWatch URL (remote mode)")
+    w.add_argument("--token", help="WW_WORKER_TOKEN of that server")
+    w.add_argument("--once", action="store_true", help="process one job and exit")
+
     a = sub.add_parser("analyze")
     a.add_argument("video")
-    a.add_argument("--zones", required=True, help="JSON file: list of {name, type: work|break|exclusion, points: [[x,y],...]} in 0-1 coords")
-    a.add_argument("-o", "--out", default="results.json")
+    a.add_argument("-o", "--out", default="results.zip")
+    a.add_argument("--model", help="yolov8n.pt (fast) / yolov8s.pt (default) / yolov8m.pt (accurate)")
+    a.add_argument("--device", help="cpu, mps or cuda:0 (default: auto)")
     a.add_argument("--sample-fps", type=float)
-    a.add_argument("--model", help="e.g. yolov8n.pt (fast) or yolov8s.pt / yolov8m.pt (more accurate)")
-    a.add_argument("--conf", type=float, help="detection confidence threshold")
-    a.add_argument("--device", help="cpu, mps (Apple GPU) or cuda:0")
 
     i = sub.add_parser("import")
     i.add_argument("video_id", type=int)
     i.add_argument("results")
 
-    d = sub.add_parser("daily")
-    d.add_argument("--date", help="YYYY-MM-DD (default: per WW_DAILY_REPORT_DAY)")
-    d.add_argument("--no-email", action="store_true")
-
-    r = sub.add_parser("record")
-    r.add_argument("camera_id", type=int)
-    r.add_argument("--minutes", type=float, default=60)
-    r.add_argument("--analyze", action="store_true")
-
-    u = sub.add_parser("create-user")
-    u.add_argument("email")
-    u.add_argument("--role", choices=["manager", "viewer"], default="viewer")
-    u.add_argument("--name", default="")
+    sub.add_parser("maintenance")
 
     sd = sub.add_parser("seed-demo")
     sd.add_argument("video")
-    sd.add_argument("--zones", help="zones JSON (default: none, draw them in the dashboard)")
-    sd.add_argument("--name", default="Sample warehouse clip")
-    sd.add_argument("--no-analyze", action="store_true")
+    sd.add_argument("--zones", required=True)
+    sd.add_argument("--name", default="Demo · steel fabrication floor")
+    sd.add_argument("--org", type=int, help="also add it to this existing organization id")
+    sd.add_argument("--all", action="store_true", help="add it to every existing organization")
+
+    co = sub.add_parser("create-org")
+    co.add_argument("name")
+    co.add_argument("email")
 
     args = ap.parse_args(argv)
 
@@ -66,62 +63,70 @@ def main(argv=None):
         import uvicorn
         uvicorn.run("workwatch.server:app", host=args.host, port=args.port)
 
+    elif args.cmd == "worker":
+        import logging
+        from . import jobs
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        if args.server:
+            jobs.remote_worker(args.server, args.token or "", once=args.once)
+        else:
+            jobs.worker_loop(once=args.once)
+
     elif args.cmd == "analyze":
+        import tempfile
+        import zipfile
         from . import pipeline
-        kw = {k: v for k, v in {"sample_fps": args.sample_fps, "model_name": args.model, "det_conf": args.conf,
-                                "device": args.device}.items() if v}
-        out = Path(args.out)
-        res = pipeline.analyze(args.video, json.loads(Path(args.zones).read_text()),
-                               thumbs_dir=str(out.with_suffix("")) + "_thumbs",
-                               progress=lambda p: print(f"\r{p * 100:5.1f}%", end="", file=sys.stderr), **kw)
+        kw = {k: v for k, v in {"model_name": args.model, "device": args.device, "sample_fps": args.sample_fps}.items() if v}
+        tmp = Path(tempfile.mkdtemp())
+        res = pipeline.detect_track(args.video, thumbs_dir=str(tmp / "thumbs"), ref_path=str(tmp / "ref.jpg"),
+                                    progress=lambda p: print(f"\r{p * 100:5.1f}%", end="", file=sys.stderr), **kw)
         print(file=sys.stderr)
-        out.write_text(json.dumps(res))
-        _print_people(res["people"])
-        print(f"\nwrote {out}  ({res['stats']['processing_s']}s)")
+        with zipfile.ZipFile(args.out, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("result.json", json.dumps(res))
+            for f in (tmp / "thumbs").glob("*.jpg"):
+                z.write(f, f"thumbs/{f.name}")
+            if (tmp / "ref.jpg").exists():
+                z.write(tmp / "ref.jpg", "ref.jpg")
+        print(json.dumps(res["stats"]))
+        print(f"wrote {args.out}")
 
     elif args.cmd == "import":
+        import tempfile
+        import zipfile
         from . import store
-        res = json.loads(Path(args.results).read_text())
-        thumbs = Path(str(Path(args.results).with_suffix("")) + "_thumbs")
-        print("run", store.import_results(args.video_id, res, thumbs_src=thumbs if thumbs.exists() else None))
+        p = Path(args.results)
+        if zipfile.is_zipfile(p):
+            tmp = Path(tempfile.mkdtemp())
+            with zipfile.ZipFile(p) as z:
+                z.extractall(tmp)
+            print("run", store.import_raw(args.video_id, json.loads((tmp / "result.json").read_text()),
+                                          thumbs_src=tmp / "thumbs", ref_src=tmp / "ref.jpg"))
+        else:
+            print("run", store.import_raw(args.video_id, json.loads(p.read_text())))
 
-    elif args.cmd == "daily":
+    elif args.cmd == "maintenance":
         from . import jobs
-        print(json.dumps(jobs.daily(report_day=args.date, send_email=not args.no_email), indent=2))
-
-    elif args.cmd == "record":
-        from . import jobs
-        vid = jobs.record_camera(args.camera_id, args.minutes)
-        print("video", vid)
-        if args.analyze:
-            jobs.analyze_video(vid)
-
-    elif args.cmd == "create-user":
-        from . import auth
-        pw = getpass.getpass("Password (8+ chars): ")
-        print(auth.create_user(args.email, pw, args.name, role=args.role))
+        print(json.dumps(jobs.maintenance(), indent=2))
 
     elif args.cmd == "seed-demo":
         from . import jobs
-        zones = json.loads(Path(args.zones).read_text()) if args.zones else []
+        res = jobs.build_demo(Path(args.video), json.loads(Path(args.zones).read_text()), args.name)
+        print("demo cached:", json.dumps(res["stats"]))
         with db.tx() as c:
-            c.execute("UPDATE videos SET is_demo=0")
-        vid = jobs.register_video(Path(args.video), args.name, zones=zones, is_demo=True)
-        print("demo video", vid)
-        if zones and not args.no_analyze:
-            jobs.analyze_video(vid)
-            from . import store
-            with db.tx() as c:
-                ps = store.run_people(c, db.latest_run_id(c, vid))
-            _print_people([{**p, "segments": p["segments"]} for p in ps])
+            orgs = [r["id"] for r in c.execute("SELECT id FROM organizations")] if args.all else (
+                [args.org] if args.org else [])
+            if orgs:
+                c.execute(f"DELETE FROM videos WHERE is_demo=1 AND org_id IN ({','.join('?' * len(orgs))})", orgs)
+        for o in orgs:
+            print(f"org {o}: demo video", jobs.clone_demo(o))
 
-
-def _print_people(people):
-    from .reports import hms
-    print(f"{'person':<16}{'working':>10}{'non-working':>13}{'flagged':>9}")
-    for p in people:
-        flagged = sum(1 for s in p["segments"] if s["flagged"])
-        print(f"{p['label']:<16}{hms(p['working_s']):>10}{hms(p['idle_s']):>13}{flagged:>9}")
+    elif args.cmd == "create-org":
+        from . import auth
+        pw = getpass.getpass("Manager password (8+ chars): ")
+        with db.tx() as c:
+            org = auth.create_org(c, args.name)
+            u = auth.create_user(c, org, email=args.email, password=pw, role="manager")
+        print(f"organization {org}, manager {u['email']}")
 
 
 if __name__ == "__main__":
